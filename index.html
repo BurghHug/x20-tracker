@@ -127,12 +127,6 @@
     cardEls[s.id] = card;
   });
 
-  function fmtDisplay(d){
-    // best_departure_estimate is usually already friendly ("5 mins", "due",
-    // or a HH:MM), so just pass it straight through.
-    return d.display || d.scheduledTime || '—';
-  }
-
   async function loadStop(stop){
     const statusEl = document.getElementById('status-' + stop.id);
     const depsEl = document.getElementById('deps-' + stop.id);
@@ -142,30 +136,42 @@
 
       if(!data.found){
         statusEl.textContent = 'no data';
-        depsEl.innerHTML = `<div class="empty">${data.reason || 'No departures found for this stop right now.'}</div>`;
+        depsEl.innerHTML = `<div class="empty">${data.reason || 'Could not reach the live data source.'}</div>`;
         return;
       }
 
       statusEl.textContent = new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+      depsEl.innerHTML = '';
 
-      if(!data.departures || data.departures.length === 0){
-        depsEl.innerHTML = '<div class="empty">No upcoming X20 departures found.</div>';
-        return;
+      if(data.live){
+        const liveRow = document.createElement('div');
+        liveRow.className = 'dep-row';
+        liveRow.innerHTML = `
+          <div>
+            <div class="dep-time mono live">${data.live.milesAway} mi away</div>
+            <div class="dep-direction">${data.live.destination ? 'Heading to ' + data.live.destination : 'Live vehicle spotted on this route'}</div>
+          </div>
+          <span class="badge live">Live</span>
+        `;
+        depsEl.appendChild(liveRow);
       }
 
-      depsEl.innerHTML = '';
-      data.departures.forEach(d=>{
+      (data.schedule || []).forEach(s=>{
         const row = document.createElement('div');
         row.className = 'dep-row';
         row.innerHTML = `
           <div>
-            <div class="dep-time mono ${d.isLive ? 'live' : 'scheduled'}">${fmtDisplay(d)}</div>
-            ${d.direction ? `<div class="dep-direction">${d.direction}</div>` : ''}
+            <div class="dep-time mono scheduled">${s.time}</div>
+            <div class="dep-direction">${s.direction || ''}</div>
           </div>
-          <span class="badge ${d.isLive ? 'live' : 'scheduled'}">${d.isLive ? 'Live' : 'Scheduled'}</span>
+          <span class="badge scheduled">Scheduled</span>
         `;
         depsEl.appendChild(row);
       });
+
+      if(!data.live && (!data.schedule || data.schedule.length === 0)){
+        depsEl.innerHTML = '<div class="empty">No data available for this stop right now.</div>';
+      }
     }catch(err){
       statusEl.textContent = 'error';
       depsEl.innerHTML = '<div class="error">Could not reach the server. Retrying automatically.</div>';
