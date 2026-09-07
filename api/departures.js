@@ -1,100 +1,140 @@
-// Vercel serverless function: given a stop, returns the next X20 departures.
+// Vercel serverless function: fetches live X20 vehicle positions directly
+// from the Bus Open Data Service (BODS) — the UK government's primary
+// open-data source for bus location — and combines it with a hand-verified
+// scheduled timetable (sourced from bustimes.org and the published
+// Warwickshire County Council school-run sheet) for each stop.
 //
-// Two of our four stops have confirmed ATCO codes (found directly on
-// bustimes.org) and are queried straight away. The other two ("Henley High
-// School" and "Bearley Oak Tree Close") don't have a verified code, so
-// rather than guess and risk silently querying the wrong stop, this
-// resolves the name to a code via TransportAPI's place search first, near
-// the given lat/lon, and caches the result in memory for next time.
+// BODS's real-time feed (SIRI-VM) only gives raw vehicle position, line,
+// and direction — it does NOT include per-stop arrival predictions the way
+// TransportAPI's aggregated endpoint did. So rather than fabricate a false
+// "X minutes away" from a raw GPS point, this reports what the data
+// actually supports: the scheduled time, plus a live "vehicle currently
+// N.N miles away" note whenever BODS has a matching bus actively
+// reporting. No invented precision.
 //
-// Requires two environment variables (set in Vercel's dashboard, never
-// committed to the repo): TRANSPORTAPI_APP_ID and TRANSPORTAPI_APP_KEY.
-// Free tier: https://developer.transportapi.com (1000 requests/day).
+// Requires one environment variable (set in Vercel, never committed):
+// BODS_API_KEY. Free account: https://data.bus-data.dft.gov.uk
 
-const APP_ID = process.env.TRANSPORTAPI_APP_ID;
-const APP_KEY = process.env.TRANSPORTAPI_APP_KEY;
+const { XMLParser } = require('fast-xml-parser');
 
-// Module-level cache: persists across warm serverless invocations (not
-// guaranteed across cold starts, but saves a lookup call most of the time).
-const resolvedCodeCache = {};
+const API_KEY = process.env.BODS_API_KEY;
 
-async function resolveAtcoCode(name, lat, lon) {
-  if (resolvedCodeCache[name]) return resolvedCodeCache[name];
+// Approximate coordinates for each stop, used only to compute a rough
+// distance to any live vehicle spotted — not for turn-by-turn precision.
+const STOPS = {
+  henleyhs: {
+    label: 'Henley High School',
+    lat: 52.2953, lon: -1.7746,
+    schedule: [{ time: '08:17', direction: 'Arriving (morning drop-off)' },
+               { time: '15:30', direction: 'Departing (afternoon pickup)' }],
+  },
+  bearley: {
+    label: 'Bearley, Oak Tree Close',
+    lat: 52.2601, lon: -1.7513,
+    schedule: [{ time: '08:00', direction: 'towards Henley High School' },
+               { time: '15:40', direction: 'towards Stratford' }],
+  },
+  maybird: {
+    label: 'Stratford, Maybird Centre',
+    lat: 52.1963, lon: -1.7301,
+    // This stop is on the regular hourly commercial X20, not the school
+    // working above — its published departures run on the hour.
+    schedule: [{ time: 'hourly, on the hour', direction: 'towards Solihull' }],
+  },
+  woodst: {
+    label: 'Stratford, Wood Street',
+    lat: 52.1917, lon: -1.7057,
+    schedule: [{ time: '07:35', direction: 'towards Henley (morning)' },
+               { time: '16:03', direction: 'arriving from Henley (afternoon)' }],
+  },
+};
 
-  const url = `https://transportapi.com/v3/uk/places.json?query=${encodeURIComponent(name)}&lat=${lat}&lon=${lon}&type=bus_stop&app_id=${APP_ID}&app_key=${APP_KEY}`;
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  const data = await res.json();
-  const member = Array.isArray(data.member) ? data.member[0] : null;
-  const code = member ? (member.atcocode || member.id) : null;
-  if (code) resolvedCodeCache[name] = code;
-  return code;
+function milesBetween(lat1, lon1, lat2, lon2) {
+  const R = 3958.8; // Earth radius in miles
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
 
-// Confirmed directly from bustimes.org — no name resolution needed.
-const KNOWN_STOPS = {
-  maybird: { label: 'Stratford, Maybird Centre', atcocode: '4200F065902' },
-  woodst:  { label: 'Stratford, Wood Street',    atcocode: '4200F067200' },
-};
+let cachedVehicles = null;
+let cachedAt = 0;
 
-// Needs resolving by name — approximate coordinates given to disambiguate.
-const LOOKUP_STOPS = {
-  henleyhs: { label: 'Henley High School', query: 'Henley-in-Arden High School', lat: 52.2953, lon: -1.7746 },
-  bearley:  { label: 'Bearley, Oak Tree Close', query: 'Bearley Oak Tree Close', lat: 52.2601, lon: -1.7513 },
-};
+async function fetchLiveX20Vehicles() {
+  // Simple in-memory cache (persists across warm invocations only) so a
+  // page with 4 stop cards doesn't trigger 4 separate upstream fetches.
+  if (cachedVehicles && Date.now() - cachedAt < 20000) return cachedVehicles;
+
+  const url = `https://data.bus-data.dft.gov.uk/api/v1/datafeed/?api_key=${API_KEY}&lineRef=X20`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`BODS upstream HTTP ${res.status}`);
+  const xml = await res.text();
+
+  const parser = new XMLParser({ ignoreAttributes: false });
+  const parsed = parser.parse(xml);
+
+  const delivery = parsed?.Siri?.ServiceDelivery?.VehicleMonitoringDelivery;
+  let activities = delivery?.VehicleActivity || [];
+  if (!Array.isArray(activities)) activities = activities ? [activities] : [];
+
+  const vehicles = activities
+    .map(a => a.MonitoredVehicleJourney)
+    .filter(Boolean)
+    .filter(mvj => String(mvj.LineRef).trim() === 'X20')
+    .map(mvj => ({
+      lat: parseFloat(mvj.VehicleLocation?.Latitude),
+      lon: parseFloat(mvj.VehicleLocation?.Longitude),
+      destination: mvj.DestinationName || null,
+      recordedAt: mvj.OriginAimedDepartureTime || null,
+    }))
+    .filter(v => Number.isFinite(v.lat) && Number.isFinite(v.lon))
+    // crude geographic sanity check — discards anything wildly outside the
+    // Stratford/Henley/Warwick area, in case another region reuses "X20"
+    .filter(v => v.lat > 51.9 && v.lat < 52.6 && v.lon > -2.2 && v.lon < -1.2);
+
+  cachedVehicles = vehicles;
+  cachedAt = Date.now();
+  return vehicles;
+}
 
 export default async function handler(req, res) {
-  if (!APP_ID || !APP_KEY) {
-    res.status(500).json({ error: 'TransportAPI credentials are not configured on the server.' });
+  if (!API_KEY) {
+    res.status(500).json({ error: 'BODS_API_KEY is not configured on the server.' });
     return;
   }
 
   const { stop } = req.query;
-  const known = KNOWN_STOPS[stop];
-  const lookup = LOOKUP_STOPS[stop];
-
-  if (!known && !lookup) {
+  const stopInfo = STOPS[stop];
+  if (!stopInfo) {
     res.status(400).json({ error: 'Unknown stop id.' });
     return;
   }
 
   try {
-    let atcocode, label;
-    if (known) {
-      atcocode = known.atcocode;
-      label = known.label;
-    } else {
-      atcocode = await resolveAtcoCode(lookup.query, lookup.lat, lookup.lon);
-      label = lookup.label;
-      if (!atcocode) {
-        res.status(200).json({ label, found: false, reason: 'Could not resolve this stop to a code yet.' });
-        return;
-      }
-    }
+    const vehicles = await fetchLiveX20Vehicles();
 
-    const liveUrl = `https://transportapi.com/v3/uk/bus/stop/${atcocode}/live.json?group=route&nextbuses=yes&route=X20&app_id=${APP_ID}&app_key=${APP_KEY}`;
-    const liveRes = await fetch(liveUrl);
-    if (!liveRes.ok) {
-      res.status(200).json({ label, atcocode, found: false, reason: `upstream HTTP ${liveRes.status}` });
-      return;
+    let nearest = null;
+    for (const v of vehicles) {
+      const dist = milesBetween(stopInfo.lat, stopInfo.lon, v.lat, v.lon);
+      if (!nearest || dist < nearest.dist) nearest = { ...v, dist };
     }
-    const liveData = await liveRes.json();
-    const departures = (liveData.departures && liveData.departures.X20) || [];
-
-    const next = departures.slice(0, 3).map(d => ({
-      // A departure counts as "live" only when TransportAPI has an actual
-      // real-time estimate that differs from the timetabled time —
-      // otherwise it's just the schedule, and we label it as such rather
-      // than implying a live GPS fix we don't actually have.
-      isLive: !!d.expected_departure_time && d.expected_departure_time !== d.aimed_departure_time,
-      display: d.best_departure_estimate || d.aimed_departure_time || d.expected_departure_time,
-      scheduledTime: d.aimed_departure_time,
-      direction: d.direction || null,
-    }));
+    // Beyond ~15 miles the vehicle is almost certainly not meaningfully
+    // "approaching" this specific stop — the whole route is only about
+    // 12 miles end to end — so don't present it as a live match.
+    if (nearest && nearest.dist > 15) nearest = null;
 
     res.setHeader('Cache-Control', 'no-store');
-    res.status(200).json({ label, atcocode, found: true, departures: next });
+    res.status(200).json({
+      found: true,
+      label: stopInfo.label,
+      schedule: stopInfo.schedule,
+      live: nearest ? {
+        milesAway: Math.round(nearest.dist * 10) / 10,
+        destination: nearest.destination,
+      } : null,
+      vehiclesActive: vehicles.length,
+    });
   } catch (err) {
-    res.status(200).json({ found: false, reason: err.message });
+    res.status(200).json({ found: false, label: stopInfo.label, schedule: stopInfo.schedule, reason: err.message });
   }
 }
